@@ -15,6 +15,7 @@
 
 
 import numpy as np
+import omni.graph.core as og
 from isaacsim.core.nodes import BaseResetNode
 from isaacsim.core.nodes.ogn.OgnIsaacArticulationControllerDatabase import OgnIsaacArticulationControllerDatabase
 from isaacsim.core.prims import SingleArticulation
@@ -65,14 +66,23 @@ class OgnIsaacArticulationControllerInternalState(BaseResetNode):
                 joint_actions.joint_efforts = joint_efforts
             self.controller_handle.apply_action(control_actions=joint_actions)
 
+    # Cyngn modification: reset the joint commands to empty !!! Otherwise, the joint commands will be applied to the previous robot
     def custom_reset(self):
-        self.controller_handle = None
         if self.initialized:
-            self.node.get_attribute("inputs:positionCommand").set(np.empty(shape=(0, 0), dtype=np.double))
-            self.node.get_attribute("inputs:velocityCommand").set(np.empty(shape=(0, 0), dtype=np.double))
-            self.node.get_attribute("inputs:effortCommand").set(np.empty(shape=(0, 0), dtype=np.double))
-
-        pass
+            empty_command = []
+            for attr_name in (
+                "inputs:positionCommand",
+                "inputs:velocityCommand",
+                "inputs:effortCommand",
+            ):
+                attribute = self.node.get_attribute(attr_name)
+                if attribute and attribute.is_valid():
+                    try:
+                        og.Controller.set(attribute, empty_command)
+                    except Exception:
+                        pass
+        self.controller_handle = None
+        self.initialized = False
 
 
 class OgnIsaacArticulationController:
