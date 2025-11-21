@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import numpy as np
+import traceback
 import omni.graph.core as og
 from isaacsim.core.nodes import BaseResetNode
 from isaacsim.core.utils.types import ArticulationAction
@@ -73,6 +74,16 @@ class OgnAckermannController:
         return OgnAckermannControllerInternalState()
 
     @staticmethod
+    def _convert_to_numpy_array(data):
+        """Convert tuple/list of numpy scalars or any sequence to numpy array."""
+        if data is None:
+            return None
+        if isinstance(data, np.ndarray):
+            return data
+        # Convert tuple/list (including numpy scalars) to numpy array
+        return np.array(data, dtype=np.float64)
+
+    @staticmethod
     def compute(db) -> bool:
         state = db.per_instance_state
 
@@ -102,13 +113,25 @@ class OgnAckermannController:
             )
 
             if actions.joint_velocities is not None:
-                db.outputs.wheelRotationVelocity = actions.joint_velocities
+                try:
+                    # Convert to numpy array for OmniGraph compatibility
+                    converted_velocities = OgnAckermannController._convert_to_numpy_array(actions.joint_velocities)
+                    db.outputs.wheelRotationVelocity = converted_velocities
+                except Exception as vel_error:
+                    # some input data from upstream may have data type mismatch, ignore for now
+                    pass
 
             if actions.joint_positions is not None:
-                db.outputs.wheelAngles = actions.joint_positions
+                try:
+                    # Convert to numpy array for OmniGraph compatibility
+                    converted_positions = OgnAckermannController._convert_to_numpy_array(actions.joint_positions)
+                    db.outputs.wheelAngles = converted_positions
+                except Exception as pos_error:
+                    # some input data from upstream may have data type mismatch, ignore for now
+                    pass
 
         except Exception as error:
-            db.log_warning(str(error))
+            db.log_warning(f"Error in compute: {error}\n{traceback.format_exc()}")
             return False
 
         db.outputs.execOut = og.ExecutionAttributeState.ENABLED
