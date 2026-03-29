@@ -181,6 +181,14 @@ private:
     size_t m_nextBuffer{ 1 };
     size_t m_totalElements{ 0 };
 
+    // Frame-drop detection: track last frame's timestamp, sensor rotation rate, and an
+    // exponential moving average of the inter-frame interval.  When the renderer delivers
+    // an empty GMO (numElements == 0) the write cursor is advanced by the estimated
+    // per-frame element count so the next valid frame lands at the correct angular offset.
+    uint64_t m_lastTimestampNs{ 0 };    // timestampNs from the previous compute call
+    double m_scanRateBaseHz{ 10.0 };    // lidar rotation rate in Hz (from sensor config)
+    double m_avgFrameIntervalNs{ 0.0 }; // EMA of inter-frame wall-clock interval (ns)
+
     // parallelism + inter-frame overlap
     // Basic data: current buffer streams
     static constexpr size_t STREAM_AZIMUTH_CURRENT = 0; // azimuth current buffer
@@ -360,6 +368,9 @@ public:
         m_currentBuffer = 0;
         m_nextBuffer = 1;
         m_totalElements = 0;
+        m_lastTimestampNs = 0;
+        m_scanRateBaseHz = 10.0;
+        m_avgFrameIntervalNs = 0.0;
         m_maxThreadsPerBlock = 0;
         m_multiProcessorCount = 0;
 
@@ -552,6 +563,7 @@ public:
                 m_maxPoints = configHelper.numChannels * configHelper.maxReturns *
                               static_cast<size_t>(std::ceil(static_cast<float>(configHelper.reportRateBaseHz) /
                                                             static_cast<float>(configHelper.scanRateBaseHz)));
+                m_scanRateBaseHz = static_cast<double>(configHelper.scanRateBaseHz);
             }
             else
             {
@@ -566,6 +578,7 @@ public:
                 m_maxPoints = numChannels * maxReturns *
                               static_cast<size_t>(std::ceil(static_cast<float>(patternFiringRateHz) /
                                                             static_cast<float>(scanRateBaseHz)));
+                m_scanRateBaseHz = static_cast<double>(scanRateBaseHz);
             }
         }
         else if (modality == omni::sensors::Modality::RADAR)
@@ -1279,9 +1292,83 @@ public:
             modality = state.hostGMO->modality;
         }
 
+        // Read the frame timestamp from the GMO header.  This field is populated by the
+        // renderer even when numElements == 0, so it is safe to read here for both paths.
+        uint64_t currentTimestampNs = 0;
+        if (state.m_dataOnHost)
+            currentTimestampNs =
+                reinterpret_cast<const omni::sensors::GenericModelOutput*>(db.inputs.dataPtr())->timestampNs;
+        else
+            currentTimestampNs = state.hostGMO->timestampNs;
+
         if (numElements == 0)
         {
-            CARB_LOG_INFO("IsaacCreateRTXLidarScanBuffer: No returns in the input buffer. Skipping execution.");
+            // Guard against duplicate frame delivery (same timestamp re-queued by renderer).
+            if (state.m_lastTimestampNs > 0 && currentTimestampNs == state.m_lastTimestampNs)
+            {
+                CARB_LOG_INFO("IsaacCreateRTXLidarScanBuffer: Duplicate frame timestamp detected; skipping.");
+                return false;
+            }
+
+            // Without any prior frame history we cannot estimate the missed angular extent.
+            if (state.m_avgFrameIntervalNs <= 0.0 || state.m_maxPoints == 0)
+            {
+                CARB_LOG_INFO("IsaacCreateRTXLidarScanBuffer: No returns in the input buffer. Skipping execution.");
+                state.m_lastTimestampNs = currentTimestampNs;
+                return false;
+            }
+
+            // Estimate how many elements should have been delivered this frame so the
+            // write cursor stays correctly aligned for subsequent valid frames.
+            //   elementsPerFrame ≈ m_maxPoints × scanRate(Hz) × avgFrameInterval(s)
+            const double elementsPerFrameEst = static_cast<double>(state.m_maxPoints) *
+                                               state.m_scanRateBaseHz *
+                                               (state.m_avgFrameIntervalNs * 1e-9);
+            const size_t advanceElements =
+                std::max(size_t(1), static_cast<size_t>(std::round(elementsPerFrameEst)));
+
+            CARB_LOG_WARN("IsaacCreateRTXLidarScanBuffer: Renderer delivered empty frame (numElements=0). "
+                          "Advancing scan-buffer cursor by %zu elements to maintain angular alignment.",
+                          advanceElements);
+
+            // Zero-fill the flags for the skipped positions so they are never treated as
+            // valid returns when the scan is eventually emitted.
+            const size_t missedStart = state.m_totalElements % state.m_maxPoints;
+            const size_t toCurrentBuf = std::min(advanceElements, state.m_maxPoints - missedStart);
+            const size_t toNextBuf = advanceElements - toCurrentBuf;
+
+            if (state.m_dataOnHost)
+            {
+                std::fill(state.h_flagsBuffers[state.m_currentBuffer].data() + missedStart,
+                          state.h_flagsBuffers[state.m_currentBuffer].data() + missedStart + toCurrentBuf,
+                          uint8_t(0));
+                if (toNextBuf > 0)
+                    std::fill(state.h_flagsBuffers[state.m_nextBuffer].data(),
+                              state.h_flagsBuffers[state.m_nextBuffer].data() + toNextBuf,
+                              uint8_t(0));
+            }
+            else
+            {
+                cudaStream_t flagStream = state.m_cudaStreams[state.STREAM_FLAGS_CURRENT];
+                CUDA_CHECK(cudaMemsetAsync(state.flagsBuffers[state.m_currentBuffer].data() + missedStart,
+                                           0, toCurrentBuf * sizeof(uint8_t), flagStream));
+                if (toNextBuf > 0)
+                {
+                    cudaStream_t flagNextStream = state.m_cudaStreams[state.STREAM_FLAGS_NEXT];
+                    CUDA_CHECK(cudaMemsetAsync(state.flagsBuffers[state.m_nextBuffer].data(),
+                                               0, toNextBuf * sizeof(uint8_t), flagNextStream));
+                    CUDA_CHECK(cudaStreamSynchronize(flagNextStream));
+                }
+                CUDA_CHECK(cudaStreamSynchronize(flagStream));
+            }
+
+            // Advance the cursor.  If the advance completes the current buffer, swap the
+            // double-buffer pair so the next valid frame writes into the fresh next buffer.
+            state.m_totalElements += advanceElements;
+            if (missedStart + toCurrentBuf == state.m_maxPoints)
+                std::swap(state.m_currentBuffer, state.m_nextBuffer);
+
+            state.m_lastTimestampNs = currentTimestampNs;
             return false;
         }
 
@@ -2250,6 +2337,18 @@ public:
             if (state.m_outputRadialVelocityMS)
                 CUDA_CHECK(cudaEventSynchronize(copyEvents[state.STREAM_RADIAL_VELOCITY_MS]));
         }
+
+        // Update the frame-interval EMA so future empty frames can estimate the correct
+        // per-frame element count.  Only update when the timestamp advanced (guards against
+        // duplicate deliveries or a zero/uninitialised timestamp from the renderer).
+        if (state.m_lastTimestampNs > 0 && currentTimestampNs > state.m_lastTimestampNs)
+        {
+            const double intervalNs = static_cast<double>(currentTimestampNs - state.m_lastTimestampNs);
+            state.m_avgFrameIntervalNs = state.m_avgFrameIntervalNs <= 0.0
+                ? intervalNs
+                : 0.9 * state.m_avgFrameIntervalNs + 0.1 * intervalNs;
+        }
+        state.m_lastTimestampNs = currentTimestampNs;
 
         return true;
     }
