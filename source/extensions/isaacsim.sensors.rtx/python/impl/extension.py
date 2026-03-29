@@ -136,10 +136,22 @@ class Extension(omni.ext.IExt):
             if target_node != node.get_prim_path() and target_node not in parent_nodes:
                 parent_nodes[target_node] = None
 
-        # Traverse upstream nodes to find desired parent nodes
+        # Traverse upstream nodes to find desired parent nodes.
+        # When multiple annotators for different render products are attached concurrently
+        # (e.g. six simultaneous lidars), og.traverse_upstream_graph may reach
+        # SdOnNewRenderProductFrame nodes that belong to a *different* render product's
+        # subgraph.  Guard against this by only accepting nodes whose containing graph
+        # matches the annotator node's own graph.
+        annotator_graph_path = node.get_graph().get_path_to_graph()
         for upstream_node in og.traverse_upstream_graph([get_prim_at_path(node.get_prim_path())]):
-            if upstream_node.get_type_name() in parent_nodes and parent_nodes[upstream_node.get_type_name()] is None:
-                parent_nodes[upstream_node.get_type_name()] = upstream_node.get_prim_path()
+            node_type = upstream_node.get_type_name()
+            if node_type in parent_nodes and parent_nodes[node_type] is None:
+                # For SdOnNewRenderProductFrame, only accept the instance that lives in the
+                # same graph as the annotator node to avoid cross-render-product wiring.
+                if node_type == "omni.syntheticdata.SdOnNewRenderProductFrame":
+                    if upstream_node.get_graph().get_path_to_graph() != annotator_graph_path:
+                        continue
+                parent_nodes[node_type] = upstream_node.get_prim_path()
 
         # Check if we found all parent nodes
         for parent_node_type in parent_nodes:
